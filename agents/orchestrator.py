@@ -223,26 +223,41 @@ class OrchestratorAgent:
             if not indicators or atr <= 0:
                 continue
 
-            # ── 2b. 市場分析 ──
-            analysis = await self.market_analyst.analyze(
-                symbol=symbol,
-                current_price=current_price,
-                primary_indicators=indicators,
-                multi_tf_data=multi_tf,
+            # ── 2b. 規則分析 (免費，不消耗 Gemini 額度) ──
+            rule_analysis = self.market_analyst._rule_analyze(
+                symbol, current_price, indicators, multi_tf
             )
 
-            # 高風險環境直接跳過
-            if analysis.get("risk_level") == "high":
+            if rule_analysis.get("risk_level") == "high":
                 logger.info(f"[跳過] {symbol} 市場風險過高")
                 continue
 
-            # ── 2c. 信號生成 ──
-            signal_result = await self.signal_generator.generate(
-                symbol=symbol,
-                market_analysis=analysis,
-                indicators=indicators,
-                current_price=current_price,
+            # ── 2c. 規則信號 (免費預篩) ──
+            rule_signal = self.signal_generator._rule_generate(
+                symbol, rule_analysis, indicators, current_price
             )
+
+            pre_signal = rule_signal.get("signal", "HOLD")
+            pre_conf   = float(rule_signal.get("confidence", 0))
+
+            # 規則說 HOLD 或信心不足 → 不呼叫 Gemini，直接跳過
+            if pre_signal == "HOLD" or pre_conf < self.cfg.agent.min_confidence:
+                logger.debug(f"[預篩] {symbol} 規則HOLD，略過Gemini")
+                continue
+
+            # ── 2d. Gemini AI 確認 (只有規則發現信號時才呼叫) ──
+            logger.info(f"[預篩通過] {symbol} {pre_signal} {pre_conf:.0f}% → 呼叫Gemini確認")
+            if self.gemini.enabled:
+                analysis = await self.market_analyst.analyze(
+                    symbol=symbol, current_price=current_price,
+                    primary_indicators=indicators, multi_tf_data=multi_tf,
+                )
+                signal_result = await self.signal_generator.generate(
+                    symbol=symbol, market_analysis=analysis,
+                    indicators=indicators, current_price=current_price,
+                )
+            else:
+                analysis, signal_result = rule_analysis, rule_signal
 
             signal = signal_result.get("signal", "HOLD")
             confidence = float(signal_result.get("confidence", 0))
