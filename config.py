@@ -84,6 +84,9 @@ class BotConfig:
     trading: TradingConfig = field(default_factory=TradingConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    telegram_token: str = field(default_factory=lambda: _env("TELEGRAM_BOT_TOKEN"))
+    telegram_chat_id: str = field(default_factory=lambda: _env("TELEGRAM_CHAT_ID"))
+    dashboard_port: int = field(default_factory=lambda: _int("DASHBOARD_PORT", 8080))
     log_level: str = "INFO"
 
     def validate(self) -> List[str]:

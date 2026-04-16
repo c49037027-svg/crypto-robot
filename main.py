@@ -52,7 +52,10 @@ def check_config():
     table.add_row("最大回撤限額", f"{config.risk.max_drawdown_pct}%")
     table.add_row("移動止損", "開啟 ✅" if config.risk.trailing_stop else "關閉")
     ai_mode = f"Gemini ({config.agent.gemini_model})" if config.agent.gemini_api_key else "純規則模式 (無 API Key)"
+    tg = "✅ 已設定" if config.telegram_token and config.telegram_token != "your_telegram_bot_token" else "❌ 未設定"
     table.add_row("AI 引擎", ai_mode)
+    table.add_row("Telegram 通知", tg)
+    table.add_row("網頁儀表板", f"http://0.0.0.0:{config.dashboard_port}")
     table.add_row("最低信心門檻", f"{config.agent.min_confidence}%")
     table.add_row("掃描間隔", f"{config.trading.scan_interval} 秒")
 

@@ -22,6 +22,8 @@ from agents.execution_agent import ExecutionAgent
 from agents.position_monitor import PositionMonitorAgent
 from utils.logger import get_logger
 from utils.helpers import format_usdt, format_pct, pct_change
+from utils.notifier import TelegramNotifier
+from web.dashboard import start_dashboard, update_state
 
 logger = get_logger("Orchestrator")
 console = Console()
@@ -88,6 +90,13 @@ class OrchestratorAgent:
             trailing_stop=cfg.risk.trailing_stop,
             max_position_age_bars=cfg.risk.max_position_age_bars,
         )
+
+        # 通知 & 儀表板
+        self.notifier = TelegramNotifier(
+            token=cfg.telegram_token,
+            chat_id=cfg.telegram_chat_id,
+        )
+        self._daily_report_hour = -1  # 每日報告追蹤
 
     def _print_banner(self):
         """啟動橫幅"""
@@ -187,6 +196,11 @@ class OrchestratorAgent:
                     f"  [{color}]{'✅ 盈利' if t.pnl >= 0 else '❌ 虧損'}[/{color}] "
                     f"{t.symbol} {t.exit_reason.upper()} | "
                     f"損益: [{color}]{format_usdt(t.pnl)}[/{color}]"
+                )
+                # Telegram 通知平倉
+                self.notifier.notify_close(
+                    t.symbol, t.side, t.entry_price, t.exit_price,
+                    t.pnl, t.pnl_pct, t.exit_reason,
                 )
 
         # ── 2. 掃描每個交易對 ──
@@ -306,13 +320,63 @@ class OrchestratorAgent:
                     f"[{'bright_green' if signal == 'LONG' else 'bright_red'}]{signal}[/] "
                     f"@ {current_price:.4f} | 盈虧比 1:{trade_setup['risk_reward']:.2f}\n"
                 )
+                # Telegram 通知開倉
+                pos = self.portfolio.positions.get(symbol)
+                self.notifier.notify_open(
+                    symbol, pos.side if pos else signal.lower(),
+                    trade_setup["entry_price"], trade_setup["stop_loss"],
+                    trade_setup["take_profit"], trade_setup["quantity"],
+                    trade_setup["risk_reward"], confidence,
+                )
+
+    def _update_dashboard(self):
+        """更新儀表板狀態"""
+        status = self.monitor.get_portfolio_status()
+        stats  = status["stats"]
+        trades = [
+            {
+                "symbol":      t.symbol,
+                "side":        t.side,
+                "entry_price": t.entry_price,
+                "exit_price":  t.exit_price,
+                "pnl":         t.pnl,
+                "pnl_pct":     t.pnl_pct,
+                "exit_reason": t.exit_reason,
+                "exit_time":   t.exit_time.strftime("%m/%d %H:%M"),
+            }
+            for t in self.portfolio.trade_history
+        ]
+        update_state(
+            cycle         = self._cycle,
+            equity        = status["total_equity"],
+            balance       = status["available_balance"],
+            total_pnl     = stats["total_pnl"],
+            total_pnl_pct = stats["total_pnl_pct"],
+            win_rate      = stats["win_rate"],
+            closed_trades = stats["closed_trades"],
+            max_drawdown  = stats["max_drawdown"],
+            positions     = status["positions"],
+            recent_trades = trades,
+        )
 
     async def run(self):
         """主循環"""
         self._print_banner()
         self._running = True
 
+        # 啟動網頁儀表板
+        start_dashboard(port=8080)
+
+        # Telegram 啟動通知
+        mode = "模擬交易" if self.cfg.exchange.paper_trading else "真實交易"
+        self.notifier.notify_start(
+            self.cfg.trading.symbols,
+            self.portfolio.balance,
+            mode,
+        )
+
         logger.info(f"掃描間隔: {self.cfg.trading.scan_interval} 秒")
+        logger.info(f"網頁儀表板: http://0.0.0.0:8080")
         logger.info("按 Ctrl+C 停止機器人\n")
 
         try:
@@ -320,6 +384,18 @@ class OrchestratorAgent:
                 try:
                     await self.run_cycle()
                     self._print_status_table()
+                    self._update_dashboard()
+
+                    # 每日報告 (UTC 00:00)
+                    hour = datetime.now(timezone.utc).hour
+                    if hour == 0 and self._daily_report_hour != 0:
+                        self._daily_report_hour = 0
+                        self.notifier.notify_daily_report(
+                            self.portfolio.stats_summary()
+                        )
+                    elif hour != 0:
+                        self._daily_report_hour = hour
+
                 except Exception as e:
                     logger.error(f"交易週期發生錯誤: {e}", exc_info=True)
 
