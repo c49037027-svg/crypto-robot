@@ -32,9 +32,7 @@ class PositionMonitorAgent:
         self.max_age_bars = max_position_age_bars
 
     async def monitor_all(self) -> List[Trade]:
-        """
-        監控所有持倉，返回本輪已平倉的交易列表
-        """
+        """監控所有持倉，返回本輪已平倉（含分批）的交易列表"""
         closed_trades = []
         symbols_to_close = []
 
@@ -47,22 +45,45 @@ class PositionMonitorAgent:
             atr = self.data_mgr.get_atr(symbol)
             pos.bars_held += 1
 
-            # 更新移動止損
-            if self.trailing_stop and atr > 0:
+            # ── TP1 分批平倉（還沒觸發過才檢查）──
+            if not pos.tp1_hit and pos.take_profit_1 > 0:
+                tp1_triggered = (
+                    (pos.side == "long"  and current_price >= pos.take_profit_1) or
+                    (pos.side == "short" and current_price <= pos.take_profit_1)
+                )
+                if tp1_triggered:
+                    qty_close = pos.initial_quantity * self.risk_mgr.cfg.tp1_close_pct
+                    trade = self.portfolio.partial_close_position(symbol, qty_close, current_price, "tp1")
+                    if trade:
+                        closed_trades.append(trade)
+                    # 移止損到成本價（保本）
+                    pos.stop_loss = pos.entry_price
+                    pos.trailing_sl = 0.0
+                    pos.tp1_hit = True
+                    logger.info(f"[TP1] {symbol} 分批平倉 {self.risk_mgr.cfg.tp1_close_pct*100:.0f}% | 止損移至成本 {pos.entry_price:.4f}")
+
+            # ── 移動止損啟動門檻檢查 ──
+            if not pos.trailing_active and atr > 0:
+                price_move = abs(current_price - pos.entry_price)
+                if price_move >= self.risk_mgr.cfg.trailing_activate_atr * atr:
+                    pos.trailing_active = True
+                    logger.info(f"[移動止損啟動] {symbol} 浮盈已達 {self.risk_mgr.cfg.trailing_activate_atr}x ATR")
+
+            # ── 移動止損更新（啟動後才追蹤）──
+            if self.trailing_stop and pos.trailing_active and atr > 0:
                 self.portfolio.update_trailing_stop(
                     symbol, current_price, atr,
                     self.risk_mgr.cfg.trailing_stop_atr_mult
                 )
 
-            # 檢查平倉條件
+            # ── 全倉平倉檢查 ──
             exit_reason = self._check_exit(pos, current_price)
             if exit_reason:
                 symbols_to_close.append((symbol, current_price, exit_reason))
             else:
-                # 報告當前狀態
                 self._log_position_status(pos, current_price, atr)
 
-        # 執行平倉
+        # 執行全倉平倉
         for symbol, price, reason in symbols_to_close:
             trade = self.portfolio.close_position(symbol, price, reason)
             if trade:

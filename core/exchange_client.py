@@ -27,7 +27,7 @@ class ExchangeClient:
     SUPPORTED = {"binance", "bybit", "okx"}
 
     def __init__(self, name: str, api_key: str, api_secret: str,
-                 testnet: bool = True, paper_trading: bool = True):
+                 passphrase: str = "", testnet: bool = True, paper_trading: bool = True):
         self.name = name.lower()
         self.paper_trading = paper_trading
         self._exchange: Optional[ccxt_async.Exchange] = None
@@ -35,31 +35,33 @@ class ExchangeClient:
         if name.lower() not in self.SUPPORTED:
             logger.warning(f"交易所 {name} 可能未完整支援，使用預設設定")
 
-        if not paper_trading:
-            self._init_exchange(name, api_key, api_secret, testnet)
+        # OKX 模擬模式：即使 paper_trading=true 也建立連線以取得真實行情
+        if not paper_trading or (name.lower() == "okx" and api_key):
+            self._init_exchange(name, api_key, api_secret, passphrase, testnet)
 
-    def _init_exchange(self, name: str, api_key: str, api_secret: str, testnet: bool):
+    def _init_exchange(self, name: str, api_key: str, api_secret: str,
+                       passphrase: str, testnet: bool):
         cls = getattr(ccxt_async, name, None)
         if cls is None:
             raise ValueError(f"不支援的交易所: {name}")
 
-        options = {}
-        if testnet:
-            if name == "binance":
-                options = {"defaultType": "future"}
-
-        self._exchange = cls({
+        config: dict = {
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
-            "options": options,
-        })
+        }
+        if passphrase:
+            config["password"] = passphrase
 
-        if testnet:
-            if hasattr(self._exchange, "set_sandbox_mode"):
-                self._exchange.set_sandbox_mode(True)
+        if name == "okx":
+            config["options"] = {"defaultType": "swap"}
 
-        logger.info(f"已連接 {name} ({'測試網' if testnet else '正式網'})")
+        self._exchange = cls(config)
+
+        if testnet and hasattr(self._exchange, "set_sandbox_mode"):
+            self._exchange.set_sandbox_mode(True)
+
+        logger.info(f"已連接 {name} ({'模擬帳戶' if testnet else '正式帳戶'})")
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str = "1h",
                           limit: int = 300) -> pd.DataFrame:
@@ -169,6 +171,26 @@ class ExchangeClient:
         except Exception as e:
             logger.error(f"取得餘額失敗: {e}")
             return {}
+
+    async def fetch_funding_rate(self, symbol: str) -> float:
+        """
+        取得永續合約資費率，返回年化百分比 (%)
+        正值: 多頭付費，負值: 空頭付費
+        無法取得時返回 0.0
+        """
+        try:
+            ex = ccxt_async.binance({
+                "enableRateLimit": True,
+                "options": {"defaultType": "future"},
+            })
+            fr = await ex.fetch_funding_rate(symbol)
+            await ex.close()
+            rate = float(fr.get("fundingRate", 0))
+            # Binance 每 8 小時結算，1 天 3 次，年化 = rate * 3 * 365
+            return rate * 3 * 365 * 100
+        except Exception as e:
+            logger.debug(f"fetch_funding_rate {symbol}: {e}")
+            return 0.0
 
     async def close(self):
         if self._exchange:

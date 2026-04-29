@@ -3,8 +3,11 @@
 職責: 協調所有子代理人，運行主要交易循環
 """
 import asyncio
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
+
+TW = timezone(timedelta(hours=8))
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -54,6 +57,7 @@ class OrchestratorAgent:
             name=cfg.exchange.name,
             api_key=cfg.exchange.api_key,
             api_secret=cfg.exchange.api_secret,
+            passphrase=cfg.exchange.passphrase,
             testnet=cfg.exchange.testnet,
             paper_trading=cfg.exchange.paper_trading,
         )
@@ -192,12 +196,12 @@ class OrchestratorAgent:
         if closed_trades:
             for t in closed_trades:
                 color = "green" if t.pnl >= 0 else "red"
+                label = "✂️ TP1分批" if t.exit_reason == "tp1" else ("✅ 盈利" if t.pnl >= 0 else "❌ 虧損")
                 console.print(
-                    f"  [{color}]{'✅ 盈利' if t.pnl >= 0 else '❌ 虧損'}[/{color}] "
+                    f"  [{color}]{label}[/{color}] "
                     f"{t.symbol} {t.exit_reason.upper()} | "
                     f"損益: [{color}]{format_usdt(t.pnl)}[/{color}]"
                 )
-                # Telegram 通知平倉
                 self.notifier.notify_close(
                     t.symbol, t.side, t.entry_price, t.exit_price,
                     t.pnl, t.pnl_pct, t.exit_reason,
@@ -255,6 +259,7 @@ class OrchestratorAgent:
             pre_conf   = float(rule_signal.get("confidence", 0))
 
             # 規則說 HOLD 或信心不足 → 不呼叫 Gemini，直接跳過
+            self._last_confidence = pre_conf
             if pre_signal == "HOLD" or pre_conf < self.cfg.agent.min_confidence:
                 logger.debug(f"[預篩] {symbol} 規則HOLD，略過Gemini")
                 continue
@@ -280,6 +285,7 @@ class OrchestratorAgent:
                 continue
 
             # 信心分數門檻
+            self._last_confidence = confidence
             if confidence < self.cfg.agent.min_confidence:
                 logger.info(
                     f"[跳過] {symbol} 信心分數 {confidence:.0f}% "
@@ -312,7 +318,12 @@ class OrchestratorAgent:
                 logger.warning(f"[風控拒絕] {symbol}: {block_reason}")
                 continue
 
-            # ── 2e. 執行交易 ──
+            # ── 2e. 資費率過濾 ──
+            trade_setup = await self._apply_funding_filter(trade_setup, signal)
+            if trade_setup is None:
+                continue
+
+            # ── 2f. 執行交易 ──
             success = await self.executor.execute_trade(trade_setup, confidence)
             if success:
                 console.print(
@@ -329,8 +340,85 @@ class OrchestratorAgent:
                     trade_setup["risk_reward"], confidence,
                 )
 
+    async def _apply_funding_filter(self, setup: Dict, signal: str) -> Optional[Dict]:
+        """
+        資費率過濾器
+        多頭且年化資費 > threshold: 縮倉 50% (市場擁擠多頭，持倉成本高)
+        空頭且年化資費 < -threshold: 縮倉 50% (市場擁擠空頭)
+        """
+        threshold = self.cfg.risk.funding_rate_max_pct
+        symbol = setup["symbol"]
+        try:
+            funding_pct = await self.exchange.fetch_funding_rate(symbol)
+        except Exception:
+            funding_pct = 0.0
+
+        crowded_long  = signal == "LONG"  and funding_pct >  threshold
+        crowded_short = signal == "SHORT" and funding_pct < -threshold
+
+        if crowded_long or crowded_short:
+            direction = "多頭擁擠" if crowded_long else "空頭擁擠"
+            logger.warning(
+                f"[資費率] {symbol} 年化 {funding_pct:.1f}% ({direction})，倉位縮減 50%"
+            )
+            reduced = dict(setup)
+            reduced["quantity"] *= 0.5
+            reduced["notional"] *= 0.5
+            reduced["risk_amount"] *= 0.5
+            return reduced
+
+        if funding_pct != 0.0:
+            logger.debug(f"[資費率] {symbol} 年化 {funding_pct:.1f}% → 正常")
+        return setup
+
+    async def _fast_price_update(self):
+        """每 10 秒快速更新持倉價格和損益（不執行完整分析）"""
+        while self._running:
+            try:
+                await asyncio.sleep(10)
+                if not self.portfolio.positions:
+                    continue
+                t0 = time.monotonic()
+                prices = {}
+                for symbol in list(self.portfolio.positions.keys()):
+                    ticker = await self.exchange.fetch_ticker(symbol)
+                    p = ticker.get("last", 0)
+                    if p > 0:
+                        prices[symbol] = p
+                        self.data_mgr.update_live_price(symbol, p)
+                latency_ms = int((time.monotonic() - t0) * 1000)
+
+                positions_info = []
+                for symbol, pos in self.portfolio.positions.items():
+                    price = prices.get(symbol, pos.entry_price)
+                    positions_info.append({
+                        "symbol":   symbol,
+                        "side":     pos.side,
+                        "entry":    pos.entry_price,
+                        "current":  price,
+                        "sl":       pos.trailing_sl if pos.trailing_sl > 0 else pos.stop_loss,
+                        "tp":       pos.take_profit,
+                        "rr":       pos.risk_reward,
+                        "pnl":      pos.unrealized_pnl(price),
+                        "pnl_pct":  pos.unrealized_pct(price),
+                        "bars_held": pos.bars_held,
+                    })
+
+                total_equity = self.portfolio.total_equity(prices)
+                stats = self.portfolio.stats_summary()
+                update_state(
+                    equity        = total_equity,
+                    balance       = self.portfolio.balance,
+                    total_pnl     = stats["total_pnl"],
+                    total_pnl_pct = stats["total_pnl_pct"],
+                    positions     = positions_info,
+                    api_latency_ms= latency_ms,
+                )
+            except Exception as e:
+                logger.debug(f"快速價格更新失敗: {e}")
+
     def _update_dashboard(self):
-        """更新儀表板狀態"""
+        """更新儀表板狀態（完整週期）"""
         status = self.monitor.get_portfolio_status()
         stats  = status["stats"]
         trades = [
@@ -342,21 +430,27 @@ class OrchestratorAgent:
                 "pnl":         t.pnl,
                 "pnl_pct":     t.pnl_pct,
                 "exit_reason": t.exit_reason,
-                "exit_time":   t.exit_time.strftime("%m/%d %H:%M"),
+                "exit_time":   t.exit_time.astimezone(TW).strftime("%m/%d %H:%M"),
             }
             for t in self.portfolio.trade_history
         ]
+        # 已實現資產 = 初始資金 + 所有已平倉損益（不含浮動）
+        realized_equity = self.portfolio.initial_balance + stats["total_pnl"]
+
         update_state(
-            cycle         = self._cycle,
-            equity        = status["total_equity"],
-            balance       = status["available_balance"],
-            total_pnl     = stats["total_pnl"],
-            total_pnl_pct = stats["total_pnl_pct"],
-            win_rate      = stats["win_rate"],
-            closed_trades = stats["closed_trades"],
-            max_drawdown  = stats["max_drawdown"],
-            positions     = status["positions"],
-            recent_trades = trades,
+            cycle             = self._cycle,
+            equity            = status["total_equity"],
+            balance           = status["available_balance"],
+            total_pnl         = stats["total_pnl"],
+            total_pnl_pct     = stats["total_pnl_pct"],
+            win_rate          = stats["win_rate"],
+            closed_trades     = stats["closed_trades"],
+            max_drawdown      = stats["max_drawdown"],
+            positions         = status["positions"],
+            recent_trades     = trades,
+            gemini_connected  = self.gemini.enabled,
+            last_confidence   = getattr(self, "_last_confidence", 0.0),
+            realized_equity   = realized_equity,
         )
 
     async def run(self):
@@ -379,6 +473,9 @@ class OrchestratorAgent:
         logger.info(f"網頁儀表板: http://0.0.0.0:8080")
         logger.info("按 Ctrl+C 停止機器人\n")
 
+        # 啟動快速價格更新 (每 10 秒)
+        asyncio.create_task(self._fast_price_update())
+
         try:
             while self._running:
                 try:
@@ -386,8 +483,8 @@ class OrchestratorAgent:
                     self._print_status_table()
                     self._update_dashboard()
 
-                    # 每日報告 (UTC 00:00)
-                    hour = datetime.now(timezone.utc).hour
+                    # 每日報告 (台灣時間 00:00)
+                    hour = datetime.now(TW).hour
                     if hour == 0 and self._daily_report_hour != 0:
                         self._daily_report_hour = 0
                         self.notifier.notify_daily_report(

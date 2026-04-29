@@ -32,6 +32,7 @@ class ExecutionAgent:
         signal    = trade_setup["signal"]
         entry     = trade_setup["entry_price"]
         sl        = trade_setup["stop_loss"]
+        tp1       = trade_setup.get("take_profit_1", 0.0)
         tp        = trade_setup["take_profit"]
         qty       = trade_setup["quantity"]
         rr        = trade_setup["risk_reward"]
@@ -76,6 +77,7 @@ class ExecutionAgent:
             risk_reward=rr,
             trailing_sl=0.0,
             order_id=order.get("id", ""),
+            take_profit_1=tp1,
         )
 
         success = self.portfolio.open_position(position)

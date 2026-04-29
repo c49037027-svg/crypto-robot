@@ -10,12 +10,27 @@ from utils.logger import get_logger
 
 logger = get_logger("SignalGenerator")
 
-_SYSTEM = """你是一位專業的加密貨幣量化交易信號系統。
+_SYSTEM = """你是一位專業的加密貨幣量化交易信號系統，負責最終的進場決策。
 
-信號規則:
-- LONG:  上升趨勢 + EMA多頭 + RSI 42-68 + MACD金叉 + 成交量放大
-- SHORT: 下降趨勢 + EMA空頭 + RSI 32-58 + MACD死叉 + 成交量放大
-- HOLD:  條件不明確 / 超買超賣 / 橫盤
+你的職責是輸出一個「最終信心分數」，這個數字必須已經在內部分析中充分考量所有風險因素。
+
+【信號邏輯】
+- LONG:  趨勢向上 + EMA多頭排列 + RSI健康 + MACD金叉 + 成交量確認
+- SHORT: 趨勢向下 + EMA空頭排列 + RSI弱勢 + MACD死叉 + 成交量確認
+- HOLD:  條件矛盾 / 市場狀態不明 / 風險過高
+
+【信心分數內部扣分規則（你必須自行執行，不需列出）】
+- 成交量低於 20MA：自動大幅扣分（-15至-25分）
+- 價格過度接近強支撐/壓力位（距離 < 0.5%）：扣分（-10至-20分）
+- ADX < 20（震盪市做趨勢單）：扣分（-10分）
+- RSI 超買（>75）做多 或 超賣（<25）做空：扣分（-15分）
+- 多時框方向不一致：扣分（-15分）
+
+【市場狀態調整】
+- Regime=ranging（震盪市）：提高 RSI/BB 判斷比重，降低 EMA 趨勢比重
+- Regime=trending（趨勢市）：提高 EMA/MACD/多時框比重，RSI 鈍化可忽略
+
+最終輸出的 confidence 必須是已扣分後的綜合決策分數。
 
 輸出嚴格 JSON，不含其他文字:
 {
@@ -76,6 +91,7 @@ class SignalGeneratorAgent:
 
 [市場分析]
 趨勢: {analysis.get('trend')} (強度:{analysis.get('trend_strength')}%)
+市場狀態(Regime): {analysis.get('regime', 'trending')}
 動量: {analysis.get('momentum')}  波動率: {analysis.get('volatility')}
 成交量確認: {analysis.get('volume_confirms')}  多時框共振: {analysis.get('multi_tf_alignment')}
 風險等級: {analysis.get('risk_level')}
@@ -98,7 +114,7 @@ BB 上={bb_u:.4f} 下={bb_l:.4f}  ATR={atr:.4f}
         return self.gemini.parse_json(raw)
 
     def _rule_generate(self, symbol, analysis, ind, price) -> Dict:
-        """多指標評分系統 (純規則)"""
+        """多指標評分系統 (純規則) — 動態權重依 Regime 調整"""
         ema9  = ind.get("ema9",  price)
         ema21 = ind.get("ema21", price)
         ema55 = ind.get("ema55", price)
@@ -113,41 +129,54 @@ BB 上={bb_u:.4f} 下={bb_l:.4f}  ATR={atr:.4f}
         vol   = ind.get("volume", 0)
         vsma  = ind.get("vol_sma20", 1)
         vol_r = vol / vsma if vsma > 0 else 1.0
-        trend = analysis.get("trend", "sideways")
-        mtf   = analysis.get("multi_tf_alignment", False)
+        trend  = analysis.get("trend", "sideways")
+        mtf    = analysis.get("multi_tf_alignment", False)
+        regime = analysis.get("regime", "trending")
+
+        # ── Regime 動態權重 ──
+        # trending: EMA/MACD/多時框加重，RSI/BB 降低（趨勢中容易鈍化）
+        # ranging:  RSI/BB 加重，EMA 降低（避免假突破雙巴）
+        if regime == "trending":
+            w_ema, w_rsi, w_bb, w_mtf, w_vol = 1.4, 0.7, 0.7, 1.5, 1.2
+        elif regime == "ranging":
+            w_ema, w_rsi, w_bb, w_mtf, w_vol = 0.7, 1.5, 1.5, 0.7, 1.0
+        else:  # volatile — 提高門檻，整體縮減
+            w_ema, w_rsi, w_bb, w_mtf, w_vol = 0.8, 0.8, 0.8, 0.8, 1.0
+
+        def w(base, weight): return base * weight
 
         # ─ 多頭評分 ─
-        lp, lr = 0, []
-        if price > ema200: lp+=15; lr.append("價格>EMA200")
-        if ema9 > ema21:   lp+=12; lr.append("EMA金叉")
-        if ema21 > ema55:  lp+=8;  lr.append("EMA21>EMA55")
-        if price > bb_m:   lp+=6;  lr.append("價格>BB中軌")
-        if price < bb_u:   lp+=4;  lr.append("未超買")
-        if 42<=rsi<=68:    lp+=12; lr.append(f"RSI健康({rsi:.0f})")
-        elif 35<=rsi<42 or 68<rsi<=72: lp+=6
-        if macd > msig:    lp+=10; lr.append("MACD金叉")
-        if mhist > 0:      lp+=4;  lr.append("MACD柱正")
-        if stoch < 70:     lp+=4;  lr.append("StochRSI<70")
-        if vol_r > 1.3:    lp+=15; lr.append(f"量放大{vol_r:.1f}x")
-        elif vol_r > 1.1:  lp+=8
-        elif vol_r > 0.9:  lp+=4
-        if mtf and trend=="bullish": lp+=10; lr.append("多時框共振")
+        lp, lr = 0.0, []
+        if price > ema200: lp+=w(15,w_ema); lr.append("價格>EMA200")
+        if ema9 > ema21:   lp+=w(12,w_ema); lr.append("EMA金叉")
+        if ema21 > ema55:  lp+=w(8, w_ema); lr.append("EMA21>EMA55")
+        if price > bb_m:   lp+=w(6, w_bb);  lr.append("價格>BB中軌")
+        if price < bb_u:   lp+=w(4, w_bb);  lr.append("未超買")
+        if 42<=rsi<=68:    lp+=w(12,w_rsi); lr.append(f"RSI健康({rsi:.0f})")
+        elif 35<=rsi<42 or 68<rsi<=72: lp+=w(6,w_rsi)
+        if macd > msig:    lp+=w(10,w_ema); lr.append("MACD金叉")
+        if mhist > 0:      lp+=w(4, w_ema); lr.append("MACD柱正")
+        if stoch < 70:     lp+=4
+        if vol_r > 1.3:    lp+=w(15,w_vol); lr.append(f"量放大{vol_r:.1f}x")
+        elif vol_r > 1.1:  lp+=w(8, w_vol)
+        elif vol_r > 0.9:  lp+=w(4, w_vol)
+        if mtf and trend=="bullish": lp+=w(10,w_mtf); lr.append("多時框共振")
 
         # ─ 空頭評分 ─
-        sp, sr = 0, []
-        if price < ema200: sp+=15; sr.append("價格<EMA200")
-        if ema9 < ema21:   sp+=12; sr.append("EMA死叉")
-        if ema21 < ema55:  sp+=8;  sr.append("EMA21<EMA55")
-        if price < bb_m:   sp+=6;  sr.append("價格<BB中軌")
-        if 32<=rsi<=58:    sp+=12; sr.append(f"RSI弱勢({rsi:.0f})")
-        elif 28<=rsi<32 or 58<rsi<=65: sp+=6
-        if macd < msig:    sp+=10; sr.append("MACD死叉")
-        if mhist < 0:      sp+=4;  sr.append("MACD柱負")
+        sp, sr = 0.0, []
+        if price < ema200: sp+=w(15,w_ema); sr.append("價格<EMA200")
+        if ema9 < ema21:   sp+=w(12,w_ema); sr.append("EMA死叉")
+        if ema21 < ema55:  sp+=w(8, w_ema); sr.append("EMA21<EMA55")
+        if price < bb_m:   sp+=w(6, w_bb);  sr.append("價格<BB中軌")
+        if 32<=rsi<=58:    sp+=w(12,w_rsi); sr.append(f"RSI弱勢({rsi:.0f})")
+        elif 28<=rsi<32 or 58<rsi<=65: sp+=w(6,w_rsi)
+        if macd < msig:    sp+=w(10,w_ema); sr.append("MACD死叉")
+        if mhist < 0:      sp+=w(4, w_ema); sr.append("MACD柱負")
         if stoch > 30:     sp+=4
-        if vol_r > 1.3:    sp+=15; sr.append(f"量放大{vol_r:.1f}x")
-        elif vol_r > 1.1:  sp+=8
-        elif vol_r > 0.9:  sp+=4
-        if mtf and trend=="bearish": sp+=10; sr.append("多時框共振")
+        if vol_r > 1.3:    sp+=w(15,w_vol); sr.append(f"量放大{vol_r:.1f}x")
+        elif vol_r > 1.1:  sp+=w(8, w_vol)
+        elif vol_r > 0.9:  sp+=w(4, w_vol)
+        if mtf and trend=="bearish": sp+=w(10,w_mtf); sr.append("多時框共振")
 
         MAX = 100
         lc = min(100, int(lp/MAX*100))

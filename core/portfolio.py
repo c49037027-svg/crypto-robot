@@ -23,9 +23,14 @@ class Position:
     risk_reward: float
     entry_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     bars_held: int = 0
-    trailing_sl: float = 0.0  # 移動止損當前價位
+    trailing_sl: float = 0.0
     order_id: str = ""
     strategy: str = "multi_signal"
+    # 分批停利欄位
+    initial_quantity: float = 0.0   # 開倉原始數量（由 portfolio 設定）
+    take_profit_1: float = 0.0      # TP1 價位（1.5 ATR）
+    tp1_hit: bool = False           # TP1 是否已觸發
+    trailing_active: bool = False   # 移動止損是否已啟動
 
     @property
     def notional(self) -> float:
@@ -167,6 +172,7 @@ class PaperPortfolio:
             return False
 
         self.balance -= cost
+        position.initial_quantity = position.quantity  # 記錄原始數量
         self.positions[position.symbol] = position
 
         logger.info(
@@ -217,6 +223,56 @@ class PaperPortfolio:
         )
         return trade
 
+    def partial_close_position(self, symbol: str, qty_to_close: float,
+                               exit_price: float, reason: str = "tp1") -> Optional[Trade]:
+        """部分平倉（TP1 分批出場）"""
+        pos = self.positions.get(symbol)
+        if pos is None:
+            return None
+
+        qty_to_close = min(qty_to_close, pos.quantity)
+        if qty_to_close <= 0:
+            return None
+
+        if pos.side == "long":
+            pnl = (exit_price - pos.entry_price) * qty_to_close
+        else:
+            pnl = (pos.entry_price - exit_price) * qty_to_close
+
+        pnl_pct = abs(exit_price - pos.entry_price) / pos.entry_price * 100
+        pnl_pct = pnl_pct if pnl >= 0 else -pnl_pct
+
+        # 還回已平倉部分的資金 + 損益
+        self.balance += pos.entry_price * qty_to_close + pnl
+        pos.quantity -= qty_to_close
+
+        if self.balance > self.peak_balance:
+            self.peak_balance = self.balance
+
+        trade = Trade(
+            symbol=symbol,
+            side=pos.side,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            quantity=qty_to_close,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            entry_time=pos.entry_time,
+            exit_time=datetime.now(timezone.utc),
+            exit_reason=reason,
+            risk_reward=pos.risk_reward,
+            strategy=pos.strategy,
+        )
+        self.trade_history.append(trade)
+
+        logger.info(
+            f"✂️ [分批平倉] {symbol} TP1 @ {exit_price:.4f} | "
+            f"平倉數量: {qty_to_close:.6f} | "
+            f"損益: {format_usdt(pnl)} ({format_pct(pnl_pct)}) | "
+            f"剩餘: {pos.quantity:.6f}"
+        )
+        return trade
+
     def update_trailing_stop(self, symbol: str, current_price: float, atr: float,
                               atr_mult: float = 1.5):
         """更新移動止損"""
@@ -254,7 +310,7 @@ class PaperPortfolio:
             "initial_balance": self.initial_balance,
             "current_balance": self.balance,
             "total_pnl": total_pnl,
-            "total_pnl_pct": pct_change(self.initial_balance, self.balance),
+            "total_pnl_pct": pct_change(self.initial_balance, self.total_equity()),
             "open_positions": self.open_positions_count,
             "closed_trades": closed,
             "win_rate": self.win_rate(),
