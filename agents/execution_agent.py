@@ -85,33 +85,31 @@ class ExecutionAgent:
             logger.error(f"無法在帳戶中記錄持倉: {symbol}")
             return False
 
-        # 真實交易所: 設定 SL/TP 止損單
-        if not self.exchange.paper_trading:
-            await self._place_sl_tp_orders(symbol, side, qty, sl, tp)
+        # 掛交易所端條件單（paper 模式用虛擬條件單薄，真實模式用 API）
+        close_side = "sell" if side == "buy" else "buy"
+
+        # SL: 全倉保護
+        sl_id = await self.exchange.place_stop_order(symbol, close_side, qty, sl, "sl")
+
+        # TP1 (分批平倉 50%)
+        tp1_id = ""
+        if tp1 > 0:
+            tp1_id = await self.exchange.place_stop_order(
+                symbol, close_side, qty * 0.5, tp1, "tp1"
+            )
+
+        # TP2: 若有 TP1 只掛剩餘 50%，否則全倉
+        tp2_qty = qty * 0.5 if tp1 > 0 else qty
+        tp2_id = await self.exchange.place_stop_order(symbol, close_side, tp2_qty, tp, "tp2")
+
+        # 把條件單 ID 存入持倉
+        pos = self.portfolio.positions.get(symbol)
+        if pos:
+            pos.sl_order_id  = sl_id
+            pos.tp1_order_id = tp1_id
+            pos.tp2_order_id = tp2_id
 
         return True
-
-    async def _place_sl_tp_orders(self, symbol: str, entry_side: str,
-                                   qty: float, sl: float, tp: float):
-        """在交易所設定止損止盈單 (真實交易用)"""
-        close_side = "sell" if entry_side == "buy" else "buy"
-        try:
-            # 止損單
-            sl_order = await self.exchange.place_order(
-                symbol=symbol, side=close_side, amount=qty,
-                price=sl, order_type="stop_loss"
-            )
-            logger.info(f"止損單已設定: {sl:.4f} | ID: {sl_order.get('id')}")
-
-            # 止盈單
-            tp_order = await self.exchange.place_order(
-                symbol=symbol, side=close_side, amount=qty,
-                price=tp, order_type="take_profit"
-            )
-            logger.info(f"止盈單已設定: {tp:.4f} | ID: {tp_order.get('id')}")
-
-        except Exception as e:
-            logger.error(f"設定止損/止盈單失敗: {e}")
 
     async def close_position(self, symbol: str, current_price: float,
                               reason: str = "manual") -> bool:

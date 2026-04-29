@@ -5,6 +5,7 @@
 from typing import Dict, List, Optional
 from core.portfolio import PaperPortfolio, Position, Trade
 from core.data_manager import DataManager
+from core.exchange_client import ExchangeClient
 from agents.risk_manager import RiskManagerAgent
 from utils.logger import get_logger
 from utils.helpers import format_usdt, format_pct
@@ -23,11 +24,12 @@ class PositionMonitorAgent:
     """
 
     def __init__(self, portfolio: PaperPortfolio, risk_manager: RiskManagerAgent,
-                 data_manager: DataManager, trailing_stop: bool = True,
-                 max_position_age_bars: int = 48):
+                 data_manager: DataManager, exchange: ExchangeClient = None,
+                 trailing_stop: bool = True, max_position_age_bars: int = 48):
         self.portfolio = portfolio
         self.risk_mgr = risk_manager
         self.data_mgr = data_manager
+        self.exchange = exchange
         self.trailing_stop = trailing_stop
         self.max_age_bars = max_position_age_bars
 
@@ -45,7 +47,45 @@ class PositionMonitorAgent:
             atr = self.data_mgr.get_atr(symbol)
             pos.bars_held += 1
 
-            # ── TP1 分批平倉（還沒觸發過才檢查）──
+            # ── 1. 交易所端條件單觸發檢查（優先）──
+            if self.exchange is not None:
+                triggered = self.exchange.check_virtual_stops(symbol, current_price)
+                skip_price_checks = False
+                for t in triggered:
+                    label = t["label"]
+                    if label == "tp1" and not pos.tp1_hit:
+                        qty_close = t["qty"]
+                        trade = self.portfolio.partial_close_position(
+                            symbol, qty_close, current_price, "tp1"
+                        )
+                        if trade:
+                            closed_trades.append(trade)
+                        # 移止損至成本，取消舊止損單，掛新保本止損
+                        pos.stop_loss  = pos.entry_price
+                        pos.trailing_sl = 0.0
+                        pos.tp1_hit    = True
+                        await self.exchange.cancel_stop_order(pos.sl_order_id, symbol)
+                        close_side = "sell" if pos.side == "long" else "buy"
+                        pos.sl_order_id = await self.exchange.place_stop_order(
+                            symbol, close_side, pos.quantity, pos.entry_price, "sl"
+                        )
+                        logger.info(
+                            f"[TP1✓] {symbol} 條件單觸發 | "
+                            f"分批 {qty_close:.4f} @ {current_price:.4f} | "
+                            f"保本止損更新 → {pos.entry_price:.4f}"
+                        )
+                    elif label == "sl":
+                        symbols_to_close.append((symbol, current_price, "sl"))
+                        skip_price_checks = True
+                        break
+                    elif label == "tp2":
+                        symbols_to_close.append((symbol, current_price, "tp"))
+                        skip_price_checks = True
+                        break
+                if skip_price_checks:
+                    continue
+
+            # ── 2. 價格比對（回退保障，條件單系統異常時仍能平倉）──
             if not pos.tp1_hit and pos.take_profit_1 > 0:
                 tp1_triggered = (
                     (pos.side == "long"  and current_price >= pos.take_profit_1) or
@@ -53,38 +93,46 @@ class PositionMonitorAgent:
                 )
                 if tp1_triggered:
                     qty_close = pos.initial_quantity * self.risk_mgr.cfg.tp1_close_pct
-                    trade = self.portfolio.partial_close_position(symbol, qty_close, current_price, "tp1")
+                    trade = self.portfolio.partial_close_position(
+                        symbol, qty_close, current_price, "tp1"
+                    )
                     if trade:
                         closed_trades.append(trade)
-                    # 移止損到成本價（保本）
                     pos.stop_loss = pos.entry_price
                     pos.trailing_sl = 0.0
                     pos.tp1_hit = True
-                    logger.info(f"[TP1] {symbol} 分批平倉 {self.risk_mgr.cfg.tp1_close_pct*100:.0f}% | 止損移至成本 {pos.entry_price:.4f}")
+                    logger.info(
+                        f"[TP1] {symbol} 價格觸發（回退）| 止損移至成本 {pos.entry_price:.4f}"
+                    )
 
-            # ── 移動止損啟動門檻檢查 ──
+            # ── 3. 移動止損 ──
             if not pos.trailing_active and atr > 0:
                 price_move = abs(current_price - pos.entry_price)
                 if price_move >= self.risk_mgr.cfg.trailing_activate_atr * atr:
                     pos.trailing_active = True
-                    logger.info(f"[移動止損啟動] {symbol} 浮盈已達 {self.risk_mgr.cfg.trailing_activate_atr}x ATR")
+                    logger.info(
+                        f"[移動止損啟動] {symbol} 浮盈已達 {self.risk_mgr.cfg.trailing_activate_atr}x ATR"
+                    )
 
-            # ── 移動止損更新（啟動後才追蹤）──
             if self.trailing_stop and pos.trailing_active and atr > 0:
                 self.portfolio.update_trailing_stop(
                     symbol, current_price, atr,
                     self.risk_mgr.cfg.trailing_stop_atr_mult
                 )
 
-            # ── 全倉平倉檢查 ──
+            # ── 4. 全倉平倉檢查 ──
             exit_reason = self._check_exit(pos, current_price)
             if exit_reason:
                 symbols_to_close.append((symbol, current_price, exit_reason))
             else:
                 self._log_position_status(pos, current_price, atr)
 
-        # 執行全倉平倉
+        # 執行全倉平倉（同時取消剩餘條件單）
         for symbol, price, reason in symbols_to_close:
+            pos = self.portfolio.positions.get(symbol)
+            if pos and self.exchange is not None:
+                for oid in (pos.sl_order_id, pos.tp1_order_id, pos.tp2_order_id):
+                    await self.exchange.cancel_stop_order(oid, symbol)
             trade = self.portfolio.close_position(symbol, price, reason)
             if trade:
                 closed_trades.append(trade)

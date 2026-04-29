@@ -91,6 +91,7 @@ class OrchestratorAgent:
             portfolio=self.portfolio,
             risk_manager=self.risk_manager,
             data_manager=self.data_mgr,
+            exchange=self.exchange,
             trailing_stop=cfg.risk.trailing_stop,
             max_position_age_bars=cfg.risk.max_position_age_bars,
         )

@@ -4,6 +4,7 @@
 紙上交易模式不會真實下單
 """
 import asyncio
+import time as _time
 import ccxt
 import ccxt.async_support as ccxt_async
 from typing import Dict, List, Optional, Any
@@ -31,6 +32,8 @@ class ExchangeClient:
         self.name = name.lower()
         self.paper_trading = paper_trading
         self._exchange: Optional[ccxt_async.Exchange] = None
+        # 虛擬條件單薄（paper trading 用，key = order_id）
+        self._virtual_orders: Dict[str, Dict] = {}
 
         if name.lower() not in self.SUPPORTED:
             logger.warning(f"交易所 {name} 可能未完整支援，使用預設設定")
@@ -171,6 +174,111 @@ class ExchangeClient:
         except Exception as e:
             logger.error(f"取得餘額失敗: {e}")
             return {}
+
+    async def place_stop_order(self, symbol: str, close_side: str,
+                               qty: float, stop_price: float, label: str = "") -> str:
+        """
+        掛條件止損/止盈單
+        close_side: 平多=sell, 平空=buy
+        label: sl | tp1 | tp2
+        返回 order_id（失敗返回空字串）
+
+        觸發方向:
+          SL  sell (平多): 價格 <= stop  → trigger_dir="down"
+          TP  sell (平多): 價格 >= stop  → trigger_dir="up"
+          SL  buy  (平空): 價格 >= stop  → trigger_dir="up"
+          TP  buy  (平空): 價格 <= stop  → trigger_dir="down"
+        """
+        order_id = f"stop_{symbol.replace('/','_')}_{label}_{int(_time.time()*1000)}"
+
+        is_tp = label.startswith("tp")
+        if close_side == "sell":
+            trigger_dir = "up" if is_tp else "down"
+        else:
+            trigger_dir = "down" if is_tp else "up"
+
+        if self.paper_trading:
+            self._virtual_orders[order_id] = {
+                "symbol":      symbol,
+                "side":        close_side,
+                "qty":         qty,
+                "stop_price":  stop_price,
+                "label":       label,
+                "trigger_dir": trigger_dir,
+                "status":      "open",
+                "fill_price":  0.0,
+            }
+            logger.info(
+                f"[虛擬條件單+] {label.upper():3} {symbol} {close_side} "
+                f"qty={qty:.4f} @ {stop_price:.4f}"
+            )
+            return order_id
+
+        # 真實交易所
+        try:
+            close_side_real = close_side
+            if self.name == "okx":
+                params = {"algoOrdType": "conditional",
+                          "triggerPx": str(stop_price), "ordPx": "-1", "tdMode": "cash"}
+                order = await self._exchange.create_order(
+                    symbol, "market", close_side_real, qty, params=params)
+            else:
+                order = await self._exchange.create_order(
+                    symbol, "stop_market", close_side_real, qty,
+                    params={"stopPrice": stop_price})
+            oid = order.get("id", order_id)
+            logger.info(f"[條件單+] {label.upper()} {symbol} @ {stop_price:.4f} | ID: {oid}")
+            return oid
+        except Exception as e:
+            logger.error(f"place_stop_order {symbol} {label}: {e}")
+            return ""
+
+    async def cancel_stop_order(self, order_id: str, symbol: str) -> bool:
+        """取消條件單"""
+        if not order_id:
+            return True
+        if self.paper_trading:
+            if order_id in self._virtual_orders:
+                self._virtual_orders[order_id]["status"] = "cancelled"
+                logger.debug(f"[虛擬條件單-] 已取消 {order_id.split('_')[-1]}")
+            return True
+        try:
+            await self._exchange.cancel_order(order_id, symbol)
+            return True
+        except Exception as e:
+            logger.debug(f"cancel_stop_order {order_id}: {e}")
+            return False
+
+    def check_virtual_stops(self, symbol: str, current_price: float) -> List[Dict]:
+        """
+        掃描虛擬條件單，回傳本次觸發的列表（paper trading 用）
+        返回: [{id, label, qty, stop_price, fill_price}]
+        trigger_dir="down": price <= stop_price 觸發（止損做多 / 止盈做空）
+        trigger_dir="up":   price >= stop_price 觸發（止盈做多 / 止損做空）
+        """
+        triggered = []
+        for oid, order in list(self._virtual_orders.items()):
+            if order["symbol"] != symbol or order["status"] != "open":
+                continue
+            stop = order["stop_price"]
+            tdir = order.get("trigger_dir", "down")
+            hit = (tdir == "down" and current_price <= stop) or \
+                  (tdir == "up"   and current_price >= stop)
+            if hit:
+                order["status"]     = "filled"
+                order["fill_price"] = current_price
+                triggered.append({
+                    "id":          oid,
+                    "label":       order["label"],
+                    "qty":         order["qty"],
+                    "stop_price":  stop,
+                    "fill_price":  current_price,
+                })
+                logger.info(
+                    f"[虛擬條件單✓] {order['label'].upper()} {symbol} "
+                    f"觸發 @ {current_price:.4f} (設定 {stop:.4f})"
+                )
+        return triggered
 
     async def fetch_funding_rate(self, symbol: str) -> float:
         """

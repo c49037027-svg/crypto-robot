@@ -31,6 +31,10 @@ class Position:
     take_profit_1: float = 0.0      # TP1 價位（1.5 ATR）
     tp1_hit: bool = False           # TP1 是否已觸發
     trailing_active: bool = False   # 移動止損是否已啟動
+    # 交易所端條件單 ID
+    sl_order_id:  str = ""
+    tp1_order_id: str = ""
+    tp2_order_id: str = ""
 
     @property
     def notional(self) -> float:
