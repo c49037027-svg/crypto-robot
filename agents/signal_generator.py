@@ -125,13 +125,26 @@ BB 上={bb_u:.4f} 下={bb_l:.4f}  ATR={atr:.4f}
         mhist = ind.get("macd_hist", 0)
         bb_u  = ind.get("bb_upper", price*1.02)
         bb_m  = ind.get("bb_mid",   price)
+        bb_l  = ind.get("bb_lower", price*0.98)
         stoch = ind.get("stoch_rsi", 50)
         vol   = ind.get("volume", 0)
         vsma  = ind.get("vol_sma20", 1)
         vol_r = vol / vsma if vsma > 0 else 1.0
+        adx_v = ind.get("adx", 25)
         trend  = analysis.get("trend", "sideways")
         mtf    = analysis.get("multi_tf_alignment", False)
         regime = analysis.get("regime", "trending")
+
+        # ── 硬性前置過濾（不達標直接 HOLD，跳過評分）──
+
+        # 1. 成交量硬門檻: < 0.7x 均量 = 流動性枯竭
+        _hold = {"symbol": symbol, "price": price, "signal": "HOLD", "confidence": 30,
+                 "entry_type": "market", "entry_price_suggestion": 0,
+                 "reasoning": "", "invalidation": "", "signal_quality": "C",
+                 "_long_pts": 0, "_short_pts": 0}
+        if vol_r < 0.7:
+            logger.debug(f"[量能過濾] {symbol} {vol_r:.1f}x < 0.7x，HOLD")
+            return {**_hold, "reasoning": f"量能枯竭({vol_r:.1f}x)"}
 
         # ── Regime 動態權重 ──
         # trending: EMA/MACD/多時框加重，RSI/BB 降低（趨勢中容易鈍化）
@@ -197,6 +210,42 @@ BB 上={bb_u:.4f} 下={bb_l:.4f}  ATR={atr:.4f}
             quality = "A" if sc>=80 else ("B" if sc>=65 else "C")
         else:
             sig, conf, reason, inv = "HOLD", max(lc,sc), "信心不足", ""
+            quality = "C"
+
+        # ── ADX < 20: 震盪市方向性過濾 ──
+        # 震盪市只接受「逆勢回歸」型進場：
+        #   LONG  需在 BB 下半段（低位買支撐）
+        #   SHORT 需在 BB 上半段（高位賣壓力）
+        if adx_v < 20 and sig != "HOLD":
+            bb_range = (bb_u - bb_l) if bb_u > bb_l else 1
+            bb_pct = (price - bb_l) / bb_range
+            if sig == "LONG" and bb_pct > 0.5:
+                logger.debug(f"[ADX過濾] {symbol} ADX={adx_v:.0f}<20 LONG@BB{bb_pct*100:.0f}% 禁止高位順勢多")
+                sig, conf, reason, inv = "HOLD", 40, f"震盪市頂部禁多(ADX={adx_v:.0f})", ""
+                quality = "C"
+            elif sig == "SHORT" and bb_pct <= 0.5:
+                logger.debug(f"[ADX過濾] {symbol} ADX={adx_v:.0f}<20 SHORT@BB{bb_pct*100:.0f}% 禁止低位順勢空")
+                sig, conf, reason, inv = "HOLD", 40, f"震盪市底部禁空(ADX={adx_v:.0f})", ""
+                quality = "C"
+
+        # 3. BB > 上軌: 強勁突破中禁止開空（等回落再空）
+        if sig == "SHORT" and price > bb_u:
+            logger.info(f"[BB過濾] {symbol} 價格>{bb_u:.4f}(BB上軌) 禁空")
+            sig, conf, reason, inv = "HOLD", 40, "價格>BB上軌禁空", ""
+            quality = "C"
+
+        # ── 動能耗竭過濾器 ──
+        # 空頭: 價格已破 BB 下軌 或 RSI < 35 → 動能耗竭，不追空（等回彈）
+        # 多頭: 價格已破 BB 上軌 或 RSI > 65 → 動能耗竭，不追多（等回落）
+        if sig == "SHORT" and (price < bb_l or rsi < 35):
+            exhaustion_reason = f"RSI={rsi:.0f}<35" if rsi < 35 else "價格<BB下軌"
+            logger.info(f"[耗竭過濾] {symbol} SHORT 拒絕 — {exhaustion_reason}，等待回彈再空")
+            sig, conf, reason, inv = "HOLD", 40, f"SHORT耗竭({exhaustion_reason})", ""
+            quality = "C"
+        elif sig == "LONG" and (price > bb_u or rsi > 65):
+            exhaustion_reason = f"RSI={rsi:.0f}>65" if rsi > 65 else "價格>BB上軌"
+            logger.info(f"[耗竭過濾] {symbol} LONG 拒絕 — {exhaustion_reason}，等待回落再多")
+            sig, conf, reason, inv = "HOLD", 40, f"LONG耗竭({exhaustion_reason})", ""
             quality = "C"
 
         if sig != "HOLD":
