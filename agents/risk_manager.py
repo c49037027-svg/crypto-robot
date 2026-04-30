@@ -47,14 +47,17 @@ class RiskManagerAgent:
             return None
 
         # 1. 計算止損和止盈
-        sl_distance = self.cfg.atr_sl_multiplier * atr
-        tp_distance = self.cfg.atr_tp_multiplier * atr
+        sl_distance  = self.cfg.atr_sl_multiplier  * atr
+        tp1_distance = self.cfg.atr_tp1_multiplier * atr  # TP1: 1.5 ATR
+        tp_distance  = self.cfg.atr_tp_multiplier  * atr  # TP2: 3.0 ATR
 
         if signal == "LONG":
-            stop_loss  = entry_price - sl_distance
+            stop_loss   = entry_price - sl_distance
+            take_profit_1 = entry_price + tp1_distance
             take_profit = entry_price + tp_distance
         else:
-            stop_loss  = entry_price + sl_distance
+            stop_loss   = entry_price + sl_distance
+            take_profit_1 = entry_price - tp1_distance
             take_profit = entry_price - tp_distance
 
         # 2. 驗證盈虧比
@@ -73,8 +76,8 @@ class RiskManagerAgent:
             logger.warning(f"[拒絕] {symbol} 計算倉位為 0")
             return None
 
-        # 確保名義值不超過可用資金 90% (防止保證金不足)
-        max_notional = account_balance * 0.90
+        # 每筆倉位名義值上限 = 帳戶餘額 / 最大持倉數 * 0.9
+        max_notional = account_balance / max(self.cfg.max_positions, 1) * 0.9
         if entry_price * quantity > max_notional:
             quantity = max_notional / entry_price
 
@@ -96,18 +99,20 @@ class RiskManagerAgent:
         )
 
         return {
-            "symbol":      symbol,
-            "signal":      signal,
-            "entry_price": entry_price,
-            "stop_loss":   stop_loss,
-            "take_profit": take_profit,
-            "sl_distance": sl_distance,
-            "tp_distance": tp_distance,
-            "risk_reward": actual_rr,
-            "quantity":    quantity,
-            "notional":    notional,
-            "risk_amount": risk_amount,
-            "atr":         atr,
+            "symbol":        symbol,
+            "signal":        signal,
+            "entry_price":   entry_price,
+            "stop_loss":     stop_loss,
+            "take_profit_1": take_profit_1,
+            "take_profit":   take_profit,
+            "sl_distance":   sl_distance,
+            "tp1_distance":  tp1_distance,
+            "tp_distance":   tp_distance,
+            "risk_reward":   actual_rr,
+            "quantity":      quantity,
+            "notional":      notional,
+            "risk_amount":   risk_amount,
+            "atr":           atr,
         }
 
     def can_open_position(

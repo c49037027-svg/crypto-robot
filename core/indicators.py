@@ -59,6 +59,26 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return tr.ewm(com=period - 1, adjust=False).mean()
 
 
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Average Directional Index — > 25 趨勢市，< 20 震盪市"""
+    prev_high  = high.shift(1)
+    prev_low   = low.shift(1)
+
+    plus_dm  = (high - prev_high).clip(lower=0)
+    minus_dm = (prev_low - low).clip(lower=0)
+    mask = plus_dm >= minus_dm
+    plus_dm  = plus_dm.where(mask, 0)
+    minus_dm = minus_dm.where(~mask, 0)
+
+    atr_val  = atr(high, low, close, period)
+    eps = 1e-10
+    plus_di  = 100 * plus_dm.ewm( com=period-1, adjust=False).mean() / (atr_val + eps)
+    minus_di = 100 * minus_dm.ewm(com=period-1, adjust=False).mean() / (atr_val + eps)
+    di_sum   = (plus_di + minus_di).replace(0, eps)
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+    return dx.ewm(com=period-1, adjust=False).mean()
+
+
 def stoch_rsi(series: pd.Series, rsi_period: int = 14, stoch_period: int = 14) -> pd.Series:
     rsi_vals = rsi(series, rsi_period)
     min_rsi = rsi_vals.rolling(stoch_period).min()
@@ -105,9 +125,16 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, pd.Series]:
 
     # 成交量
     ind["vol_sma20"] = v.rolling(20).mean()
+    ind["volume"]    = v
 
     # Stochastic RSI
     ind["stoch_rsi"] = stoch_rsi(c)
+
+    # ADX (趨勢強度)
+    ind["adx"] = adx(h, l, c, 14)
+
+    # 收盤價 (供多時框比對用)
+    ind["close"] = c
 
     return ind
 

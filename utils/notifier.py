@@ -56,8 +56,10 @@ class TelegramNotifier:
         )
 
     def notify_close(self, symbol, side, entry, exit_price, pnl, pnl_pct, reason):
-        if reason == "tp":
-            emoji, label = "✅", "止盈出場"
+        if reason == "tp1":
+            emoji, label = "✂️", "TP1 分批平倉 (50%)"
+        elif reason == "tp":
+            emoji, label = "✅", "止盈出場 (全平)"
         elif reason == "sl":
             emoji, label = "❌", "止損出場"
         elif reason == "timeout":

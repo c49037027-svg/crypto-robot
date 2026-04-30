@@ -28,6 +28,8 @@ class DataManager:
         self._cache: Dict[str, Dict[str, pd.DataFrame]] = {}
         self._indicator_cache: Dict[str, Dict[str, Dict]] = {}
         self._last_update: Dict[str, Dict[str, datetime]] = {}
+        # 即時價格快取（由快速更新迴圈寫入）
+        self._live_prices: Dict[str, float] = {}
 
     async def refresh(self, symbol: str) -> bool:
         """刷新指定交易對的所有時間框架數據"""
@@ -65,7 +67,15 @@ class DataManager:
         tf = timeframe or self.primary_tf
         return self._indicator_cache.get(symbol, {}).get(tf)
 
+    def update_live_price(self, symbol: str, price: float):
+        """由快速更新迴圈寫入即時價格"""
+        if price > 0:
+            self._live_prices[symbol] = price
+
     def get_current_price(self, symbol: str) -> float:
+        # 優先用即時價格（每 10 秒更新），回退用 OHLCV 快取
+        if symbol in self._live_prices:
+            return self._live_prices[symbol]
         df = self.get_ohlcv(symbol)
         if df is not None and not df.empty:
             return float(df["close"].iloc[-1])

@@ -32,8 +32,9 @@ def _int(key: str, default: int = 0) -> int:
 @dataclass
 class ExchangeConfig:
     name: str = field(default_factory=lambda: _env("EXCHANGE_NAME", "binance"))
-    api_key: str = field(default_factory=lambda: _env("EXCHANGE_API_KEY"))
-    api_secret: str = field(default_factory=lambda: _env("EXCHANGE_API_SECRET"))
+    api_key: str = field(default_factory=lambda: _env("EXCHANGE_API_KEY") or _env("OKX_API_KEY"))
+    api_secret: str = field(default_factory=lambda: _env("EXCHANGE_API_SECRET") or _env("OKX_SECRET_KEY"))
+    passphrase: str = field(default_factory=lambda: _env("EXCHANGE_PASSPHRASE") or _env("OKX_PASSPHRASE"))
     testnet: bool = field(default_factory=lambda: _bool("TESTNET", True))
     paper_trading: bool = field(default_factory=lambda: _bool("PAPER_TRADING", True))
     paper_balance: float = field(default_factory=lambda: _float("PAPER_BALANCE", 10000.0))
@@ -65,10 +66,15 @@ class RiskConfig:
     max_drawdown_pct: float = field(default_factory=lambda: _float("MAX_DRAWDOWN", 10.0))
     min_risk_reward: float = field(default_factory=lambda: _float("MIN_RISK_REWARD", 1.5))
     atr_sl_multiplier: float = 2.0
-    atr_tp_multiplier: float = 3.0
+    atr_tp1_multiplier: float = 1.5   # TP1 分批平倉（平 50%）
+    atr_tp_multiplier: float = 3.0    # TP2 全平
+    tp1_close_pct: float = 0.5        # TP1 平倉比例
     trailing_stop: bool = True
     trailing_stop_atr_mult: float = 1.5
-    max_position_age_bars: int = 48
+    trailing_activate_atr: float = 1.0  # 浮盈超過 N 倍 ATR 才啟動移動止損
+    max_position_age_bars: int = field(default_factory=lambda: _int("MAX_POSITION_AGE_BARS", 168))
+    # 資費率過濾: 年化超過此值(%)，縮減倉位 50%
+    funding_rate_max_pct: float = field(default_factory=lambda: _float("FUNDING_RATE_MAX", 50.0))
 
 
 @dataclass
