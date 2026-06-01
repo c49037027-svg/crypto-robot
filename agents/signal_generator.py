@@ -1,104 +1,24 @@
 """
-信號生成代理人 (SignalGeneratorAgent)
-- 有 Gemini Key → AI 生成信號 + 信心分數
-- 無 Key       → 多指標評分系統 (自動回退)
+信號生成代理人 (SignalGeneratorAgent) V2.0
+純技術指標 (TA-based) 規則引擎，零延遲，不呼叫 Gemini。
 """
-import asyncio
 from typing import Dict
-from agents.gemini_client import GeminiClient
 from utils.logger import get_logger
 
 logger = get_logger("SignalGenerator")
 
-_SYSTEM = """你是一位專業的加密貨幣量化交易信號系統。
-
-信號規則:
-- LONG:  上升趨勢 + EMA多頭 + RSI 42-68 + MACD金叉 + 成交量放大
-- SHORT: 下降趨勢 + EMA空頭 + RSI 32-58 + MACD死叉 + 成交量放大
-- HOLD:  條件不明確 / 超買超賣 / 橫盤
-
-輸出嚴格 JSON，不含其他文字:
-{
-  "signal": "LONG" | "SHORT" | "HOLD",
-  "confidence": 0到100的整數,
-  "entry_type": "market",
-  "entry_price_suggestion": 0,
-  "reasoning": "進場理由(50字以內中文)",
-  "invalidation": "信號失效條件(30字以內)",
-  "signal_quality": "A" | "B" | "C"
-}"""
-
 
 class SignalGeneratorAgent:
-    def __init__(self, gemini: GeminiClient = None):
-        self.gemini = gemini or GeminiClient("")
+    def __init__(self, gemini=None):  # gemini 參數保留以維持呼叫介面相容
+        pass
 
     async def generate(self, symbol: str, market_analysis: Dict,
                        indicators: Dict[str, float],
                        current_price: float) -> Dict:
-
-        # ── 先嘗試 Gemini AI ──
-        if self.gemini.enabled:
-            result = await self._ai_generate(symbol, market_analysis,
-                                             indicators, current_price)
-            if result and result.get("signal") in ("LONG", "SHORT", "HOLD"):
-                result["symbol"] = symbol
-                result["price"]  = current_price
-                sig = result["signal"]
-                conf = result.get("confidence", 0)
-                if sig != "HOLD":
-                    logger.info(
-                        f"[Gemini信號] {symbol} {sig} | 信心:{conf}% | "
-                        f"品質:{result.get('signal_quality')} | {result.get('reasoning','')}"
-                    )
-                else:
-                    logger.debug(f"[Gemini信號] {symbol} HOLD")
-                return result
-
-        # ── 回退: 純規則評分 ──
         return self._rule_generate(symbol, market_analysis, indicators, current_price)
 
-    async def _ai_generate(self, symbol, analysis, ind, price) -> Dict:
-        ema9  = ind.get("ema9",  price)
-        ema21 = ind.get("ema21", price)
-        ema200= ind.get("ema200",price)
-        rsi   = ind.get("rsi",  50)
-        macd  = ind.get("macd",  0)
-        msig  = ind.get("macd_signal", 0)
-        bb_u  = ind.get("bb_upper", price*1.02)
-        bb_l  = ind.get("bb_lower", price*0.98)
-        atr   = ind.get("atr", price*0.01)
-        stoch = ind.get("stoch_rsi", 50)
-        vol   = ind.get("volume", 0)
-        vsma  = ind.get("vol_sma20", 1)
-
-        prompt = f"""交易對: {symbol}  價格: {price:.4f} USDT
-
-[市場分析]
-趨勢: {analysis.get('trend')} (強度:{analysis.get('trend_strength')}%)
-動量: {analysis.get('momentum')}  波動率: {analysis.get('volatility')}
-成交量確認: {analysis.get('volume_confirms')}  多時框共振: {analysis.get('multi_tf_alignment')}
-風險等級: {analysis.get('risk_level')}
-摘要: {analysis.get('analysis')}
-
-[指標]
-EMA9={ema9:.4f} EMA21={ema21:.4f} EMA200={ema200:.4f}
-RSI={rsi:.1f}  StochRSI={stoch:.1f}
-MACD={'金叉' if macd>msig else '死叉'} ({macd:.6f} vs {msig:.6f})
-BB 上={bb_u:.4f} 下={bb_l:.4f}  ATR={atr:.4f}
-成交量={vol/(vsma or 1):.2f}x均量
-
-支撐: {analysis.get('key_levels',{}).get('support',0):.4f}
-阻力: {analysis.get('key_levels',{}).get('resistance',0):.4f}
-
-請輸出 JSON 信號。"""
-
-        loop = asyncio.get_event_loop()
-        raw = await loop.run_in_executor(None, self.gemini.call, _SYSTEM, prompt)
-        return self.gemini.parse_json(raw)
-
     def _rule_generate(self, symbol, analysis, ind, price) -> Dict:
-        """多指標評分系統 (純規則)"""
+        """多指標評分系統 (純規則) — 動態權重依 Regime 調整"""
         ema9  = ind.get("ema9",  price)
         ema21 = ind.get("ema21", price)
         ema55 = ind.get("ema55", price)
@@ -109,45 +29,79 @@ BB 上={bb_u:.4f} 下={bb_l:.4f}  ATR={atr:.4f}
         mhist = ind.get("macd_hist", 0)
         bb_u  = ind.get("bb_upper", price*1.02)
         bb_m  = ind.get("bb_mid",   price)
+        bb_l  = ind.get("bb_lower", price*0.98)
         stoch = ind.get("stoch_rsi", 50)
         vol   = ind.get("volume", 0)
         vsma  = ind.get("vol_sma20", 1)
         vol_r = vol / vsma if vsma > 0 else 1.0
-        trend = analysis.get("trend", "sideways")
-        mtf   = analysis.get("multi_tf_alignment", False)
+        adx_v = ind.get("adx", 25)
+        trend  = analysis.get("trend", "sideways")
+        mtf    = analysis.get("multi_tf_alignment", False)
+        regime = analysis.get("regime", "trending")
+
+        # ── 硬性前置過濾（不達標直接 HOLD，跳過評分）──
+
+        # 1. 成交量硬門檻: < 0.7x 均量 = 流動性枯竭
+        _hold = {"symbol": symbol, "price": price, "signal": "HOLD", "confidence": 30,
+                 "entry_type": "market", "entry_price_suggestion": 0,
+                 "reasoning": "", "invalidation": "", "signal_quality": "C",
+                 "_long_pts": 0, "_short_pts": 0}
+        if vol_r < 0.7:
+            logger.debug(f"[量能過濾] {symbol} {vol_r:.1f}x < 0.7x，HOLD")
+            return {**_hold, "reasoning": f"量能枯竭({vol_r:.1f}x)"}
+
+        # 2. BB 絕對禁飛區: 價格在帶外 → 全面禁止開倉（防止追高殺低）
+        if price > bb_u:
+            logger.debug(f"[BB禁飛] {symbol} 價格{price:.2f}>{bb_u:.2f} BB上軌，禁止開倉")
+            return {**_hold, "reasoning": "價格>BB上軌禁止開倉"}
+        if price < bb_l:
+            logger.debug(f"[BB禁飛] {symbol} 價格{price:.2f}<{bb_l:.2f} BB下軌，禁止開倉")
+            return {**_hold, "reasoning": "價格<BB下軌禁止開倉"}
+
+        # ── Regime 動態權重 ──
+        # trending: EMA/MACD/多時框加重，RSI/BB 降低（趨勢中容易鈍化）
+        # ranging:  RSI/BB 加重，EMA 降低（避免假突破雙巴）
+        if regime == "trending":
+            w_ema, w_rsi, w_bb, w_mtf, w_vol = 1.4, 0.7, 0.7, 1.5, 1.2
+        elif regime == "ranging":
+            w_ema, w_rsi, w_bb, w_mtf, w_vol = 0.7, 1.5, 1.5, 0.7, 1.0
+        else:  # volatile — 提高門檻，整體縮減
+            w_ema, w_rsi, w_bb, w_mtf, w_vol = 0.8, 0.8, 0.8, 0.8, 1.0
+
+        def w(base, weight): return base * weight
 
         # ─ 多頭評分 ─
-        lp, lr = 0, []
-        if price > ema200: lp+=15; lr.append("價格>EMA200")
-        if ema9 > ema21:   lp+=12; lr.append("EMA金叉")
-        if ema21 > ema55:  lp+=8;  lr.append("EMA21>EMA55")
-        if price > bb_m:   lp+=6;  lr.append("價格>BB中軌")
-        if price < bb_u:   lp+=4;  lr.append("未超買")
-        if 42<=rsi<=68:    lp+=12; lr.append(f"RSI健康({rsi:.0f})")
-        elif 35<=rsi<42 or 68<rsi<=72: lp+=6
-        if macd > msig:    lp+=10; lr.append("MACD金叉")
-        if mhist > 0:      lp+=4;  lr.append("MACD柱正")
-        if stoch < 70:     lp+=4;  lr.append("StochRSI<70")
-        if vol_r > 1.3:    lp+=15; lr.append(f"量放大{vol_r:.1f}x")
-        elif vol_r > 1.1:  lp+=8
-        elif vol_r > 0.9:  lp+=4
-        if mtf and trend=="bullish": lp+=10; lr.append("多時框共振")
+        lp, lr = 0.0, []
+        if price > ema200: lp+=w(15,w_ema); lr.append("價格>EMA200")
+        if ema9 > ema21:   lp+=w(12,w_ema); lr.append("EMA金叉")
+        if ema21 > ema55:  lp+=w(8, w_ema); lr.append("EMA21>EMA55")
+        if price > bb_m:   lp+=w(6, w_bb);  lr.append("價格>BB中軌")
+        if price < bb_u:   lp+=w(4, w_bb);  lr.append("未超買")
+        if 42<=rsi<=68:    lp+=w(12,w_rsi); lr.append(f"RSI健康({rsi:.0f})")
+        elif 35<=rsi<42 or 68<rsi<=72: lp+=w(6,w_rsi)
+        if macd > msig:    lp+=w(10,w_ema); lr.append("MACD金叉")
+        if mhist > 0:      lp+=w(4, w_ema); lr.append("MACD柱正")
+        if stoch < 70:     lp+=4
+        if vol_r > 1.3:    lp+=w(15,w_vol); lr.append(f"量放大{vol_r:.1f}x")
+        elif vol_r > 1.1:  lp+=w(8, w_vol)
+        elif vol_r > 0.9:  lp+=w(4, w_vol)
+        if mtf and trend=="bullish": lp+=w(10,w_mtf); lr.append("多時框共振")
 
         # ─ 空頭評分 ─
-        sp, sr = 0, []
-        if price < ema200: sp+=15; sr.append("價格<EMA200")
-        if ema9 < ema21:   sp+=12; sr.append("EMA死叉")
-        if ema21 < ema55:  sp+=8;  sr.append("EMA21<EMA55")
-        if price < bb_m:   sp+=6;  sr.append("價格<BB中軌")
-        if 32<=rsi<=58:    sp+=12; sr.append(f"RSI弱勢({rsi:.0f})")
-        elif 28<=rsi<32 or 58<rsi<=65: sp+=6
-        if macd < msig:    sp+=10; sr.append("MACD死叉")
-        if mhist < 0:      sp+=4;  sr.append("MACD柱負")
+        sp, sr = 0.0, []
+        if price < ema200: sp+=w(15,w_ema); sr.append("價格<EMA200")
+        if ema9 < ema21:   sp+=w(12,w_ema); sr.append("EMA死叉")
+        if ema21 < ema55:  sp+=w(8, w_ema); sr.append("EMA21<EMA55")
+        if price < bb_m:   sp+=w(6, w_bb);  sr.append("價格<BB中軌")
+        if 32<=rsi<=58:    sp+=w(12,w_rsi); sr.append(f"RSI弱勢({rsi:.0f})")
+        elif 28<=rsi<32 or 58<rsi<=65: sp+=w(6,w_rsi)
+        if macd < msig:    sp+=w(10,w_ema); sr.append("MACD死叉")
+        if mhist < 0:      sp+=w(4, w_ema); sr.append("MACD柱負")
         if stoch > 30:     sp+=4
-        if vol_r > 1.3:    sp+=15; sr.append(f"量放大{vol_r:.1f}x")
-        elif vol_r > 1.1:  sp+=8
-        elif vol_r > 0.9:  sp+=4
-        if mtf and trend=="bearish": sp+=10; sr.append("多時框共振")
+        if vol_r > 1.3:    sp+=w(15,w_vol); sr.append(f"量放大{vol_r:.1f}x")
+        elif vol_r > 1.1:  sp+=w(8, w_vol)
+        elif vol_r > 0.9:  sp+=w(4, w_vol)
+        if mtf and trend=="bearish": sp+=w(10,w_mtf); sr.append("多時框共振")
 
         MAX = 100
         lc = min(100, int(lp/MAX*100))
@@ -169,6 +123,24 @@ BB 上={bb_u:.4f} 下={bb_l:.4f}  ATR={atr:.4f}
         else:
             sig, conf, reason, inv = "HOLD", max(lc,sc), "信心不足", ""
             quality = "C"
+
+        # ── ADX < 20: 震盪市方向性過濾 ──
+        # 震盪市只接受「逆勢回歸」型進場：
+        #   LONG  需在 BB 下半段（低位買支撐）
+        #   SHORT 需在 BB 上半段（高位賣壓力）
+        if adx_v < 20 and sig != "HOLD":
+            bb_range = (bb_u - bb_l) if bb_u > bb_l else 1
+            bb_pct = (price - bb_l) / bb_range
+            if sig == "LONG" and bb_pct > 0.5:
+                logger.debug(f"[ADX過濾] {symbol} ADX={adx_v:.0f}<20 LONG@BB{bb_pct*100:.0f}% 禁止高位順勢多")
+                sig, conf, reason, inv = "HOLD", 40, f"震盪市頂部禁多(ADX={adx_v:.0f})", ""
+                quality = "C"
+            elif sig == "SHORT" and bb_pct <= 0.5:
+                logger.debug(f"[ADX過濾] {symbol} ADX={adx_v:.0f}<20 SHORT@BB{bb_pct*100:.0f}% 禁止低位順勢空")
+                sig, conf, reason, inv = "HOLD", 40, f"震盪市底部禁空(ADX={adx_v:.0f})", ""
+                quality = "C"
+
+        # BB 帶外已由前置過濾器（第 2 道）完全攔截，此處無需重複檢查
 
         if sig != "HOLD":
             logger.info(f"[規則信號] {symbol} {sig} | 信心:{conf}% | 品質:{quality} | {reason}")
